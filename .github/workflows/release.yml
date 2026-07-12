@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            triple: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            triple: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin"
+          # ubuntu-22.04 keeps AppImage glibc/WebKitGTK requirements broad
+          - platform: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            args: ""
+          - platform: windows-latest
+            triple: x86_64-pc-windows-msvc
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download sidecar binaries (yt-dlp + ffmpeg)
+        run: node scripts/download-sidecars.mjs --triple ${{ matrix.triple }}
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Video Downloader ${{ github.ref_name }}"
+          releaseBody: |
+            See the assets below for your platform.
+            - Windows builds are unsigned: SmartScreen will warn — click "More info" → "Run anyway".
+            - macOS builds are not notarized: right-click the app → Open, or run `xattr -dc` on it.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

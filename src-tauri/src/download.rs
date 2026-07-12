@@ -1,0 +1,515 @@
+use std::collections::HashMap;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tauri::{AppHandle, Emitter, State};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Child;
+use tokio::sync::{Mutex, Semaphore};
+use uuid::Uuid;
+
+use crate::engine;
+use crate::info::extract_error;
+use crate::persist;
+
+pub const EVT_PROGRESS: &str = "download://progress";
+pub const EVT_STATUS: &str = "download://status";
+pub const EVT_COMPLETE: &str = "download://complete";
+pub const EVT_ERROR: &str = "download://error";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStatus {
+    Queued,
+    Downloading,
+    Processing,
+    Paused,
+    Completed,
+    Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadRequest {
+    pub url: String,
+    pub dest_dir: String,
+    #[serde(default)]
+    pub format_selector: Option<String>,
+    #[serde(default)]
+    pub audio_only: bool,
+    #[serde(default)]
+    pub audio_format: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub thumbnail: Option<String>,
+}
+
+struct Job {
+    request: DownloadRequest,
+    status: JobStatus,
+    child: Option<Arc<Mutex<Child>>>,
+    /// last tmpfilename/filename seen in progress lines — used for cancel cleanup
+    tmp_files: Vec<String>,
+    filepath: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobSnapshot {
+    pub id: String,
+    pub url: String,
+    pub title: Option<String>,
+    pub thumbnail: Option<String>,
+    pub dest_dir: String,
+    pub audio_only: bool,
+    pub status: JobStatus,
+    pub filepath: Option<String>,
+    pub error: Option<String>,
+}
+
+pub struct DownloadManager {
+    jobs: Mutex<HashMap<String, Job>>,
+    semaphore: std::sync::Mutex<Arc<Semaphore>>,
+}
+
+impl DownloadManager {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            jobs: Mutex::new(HashMap::new()),
+            semaphore: std::sync::Mutex::new(Arc::new(Semaphore::new(max_concurrent.max(1)))),
+        }
+    }
+
+    fn current_semaphore(&self) -> Arc<Semaphore> {
+        self.semaphore.lock().unwrap().clone()
+    }
+
+    fn set_max_concurrent(&self, n: usize) {
+        *self.semaphore.lock().unwrap() = Arc::new(Semaphore::new(n.max(1)));
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusPayload {
+    id: String,
+    status: JobStatus,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressPayload {
+    id: String,
+    stage: String, // "downloading" | "processing"
+    downloaded: Option<u64>,
+    total: Option<u64>,
+    percent: Option<f64>,
+    speed: Option<f64>,
+    eta: Option<f64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletePayload {
+    id: String,
+    filepath: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ErrorPayload {
+    id: String,
+    message: String,
+}
+
+fn emit_status(app: &AppHandle, id: &str, status: JobStatus) {
+    let _ = app.emit(EVT_STATUS, StatusPayload { id: id.into(), status });
+}
+
+fn build_args(req: &DownloadRequest, ffmpeg_dir: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+
+    if req.audio_only {
+        let fmt = req.audio_format.as_deref().unwrap_or("mp3");
+        if fmt == "m4a" {
+            args.extend(["-f".into(), "bestaudio[ext=m4a]/bestaudio/best".into()]);
+        } else {
+            args.extend(["-f".into(), "bestaudio/best".into()]);
+        }
+        args.extend([
+            "-x".into(),
+            "--audio-format".into(),
+            fmt.into(),
+            "--audio-quality".into(),
+            "0".into(),
+        ]);
+    } else {
+        let selector = req
+            .format_selector
+            .clone()
+            .unwrap_or_else(|| "bestvideo+bestaudio/best".into());
+        args.extend(["-f".into(), selector]);
+    }
+
+    args.extend([
+        "--ffmpeg-location".into(),
+        ffmpeg_dir.into(),
+        "-P".into(),
+        req.dest_dir.clone(),
+        "-o".into(),
+        "%(title)s [%(id)s].%(ext)s".into(),
+        "--no-playlist".into(),
+        "--newline".into(),
+        "--no-warnings".into(),
+        "--continue".into(),
+        "--windows-filenames".into(),
+        "--trim-filenames".into(),
+        "200".into(),
+        "--progress-template".into(),
+        "download:PROG::%(progress)j".into(),
+        "--progress-template".into(),
+        "postprocess:PP::%(progress)j".into(),
+        "--print".into(),
+        "after_move:FILE::%(filepath)s".into(),
+        "--no-simulate".into(),
+        "--".into(),
+        req.url.clone(),
+    ]);
+    args
+}
+
+async fn run_job(app: AppHandle, manager: Arc<DownloadManager>, id: String) {
+    let permit = match manager.current_semaphore().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    // The job may have been cancelled while queued, or this permit may be from
+    // a swapped-out semaphore — re-check state before spawning.
+    let request = {
+        let jobs = manager.jobs.lock().await;
+        match jobs.get(&id) {
+            Some(j) if j.status == JobStatus::Queued => j.request.clone(),
+            _ => return,
+        }
+    };
+
+    let spawn_result: Result<Child, String> = (|| {
+        let ffmpeg_dir = engine::ffmpeg_location()?.to_string_lossy().into_owned();
+        let mut cmd = engine::ytdlp_command(&app)?;
+        cmd.args(build_args(&request, &ffmpeg_dir))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn().map_err(|e| format!("failed to start yt-dlp: {e}"))
+    })();
+
+    let mut child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            fail_job(&app, &manager, &id, e).await;
+            drop(permit);
+            return;
+        }
+    };
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let child = Arc::new(Mutex::new(child));
+
+    {
+        let mut jobs = manager.jobs.lock().await;
+        if let Some(job) = jobs.get_mut(&id) {
+            job.child = Some(child.clone());
+            job.status = JobStatus::Downloading;
+        }
+    }
+    emit_status(&app, &id, JobStatus::Downloading);
+
+    // stderr collector (bounded)
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut buf: Vec<String> = Vec::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if buf.len() >= 50 {
+                buf.remove(0);
+            }
+            buf.push(line);
+        }
+        buf.join("\n")
+    });
+
+    // stdout: progress + final file path
+    let mut lines = BufReader::new(stdout).lines();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut final_path: Option<String> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(json) = line.strip_prefix("PROG::") {
+            if let Ok(p) = serde_json::from_str::<Value>(json) {
+                track_tmp_files(&manager, &id, &p).await;
+                if last_emit.elapsed() >= Duration::from_millis(250) {
+                    last_emit = Instant::now();
+                    emit_progress(&app, &id, &p, "downloading");
+                }
+            }
+        } else if let Some(json) = line.strip_prefix("PP::") {
+            let mark = {
+                let mut jobs = manager.jobs.lock().await;
+                jobs.get_mut(&id)
+                    .filter(|j| j.status == JobStatus::Downloading)
+                    .map(|j| {
+                        j.status = JobStatus::Processing;
+                    })
+                    .is_some()
+            };
+            if mark {
+                emit_status(&app, &id, JobStatus::Processing);
+            }
+            if let Ok(p) = serde_json::from_str::<Value>(json) {
+                emit_progress(&app, &id, &p, "processing");
+            }
+        } else if let Some(path) = line.strip_prefix("FILE::") {
+            final_path = Some(path.to_string());
+        }
+    }
+
+    let exit = child.lock().await.wait().await;
+    let stderr_text = stderr_task.await.unwrap_or_default();
+
+    let mut jobs = manager.jobs.lock().await;
+    let Some(job) = jobs.get_mut(&id) else { return };
+    job.child = None;
+
+    match job.status {
+        // pause_download / cancel_download killed the process and already set
+        // the terminal state — leave it alone.
+        JobStatus::Paused | JobStatus::Cancelled => {}
+        _ => match exit {
+            Ok(status) if status.success() => {
+                job.status = JobStatus::Completed;
+                job.filepath = final_path.clone();
+                let entry = persist::HistoryEntry {
+                    id: id.clone(),
+                    url: job.request.url.clone(),
+                    title: job.request.title.clone().unwrap_or_else(|| job.request.url.clone()),
+                    filepath: final_path.clone(),
+                    audio_only: job.request.audio_only,
+                    completed_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                };
+                drop(jobs);
+                persist::append_history(&app, entry);
+                emit_status(&app, &id, JobStatus::Completed);
+                let _ = app.emit(EVT_COMPLETE, CompletePayload { id: id.clone(), filepath: final_path });
+            }
+            _ => {
+                let msg = extract_error(&stderr_text);
+                job.status = JobStatus::Error;
+                job.error = Some(msg.clone());
+                drop(jobs);
+                emit_status(&app, &id, JobStatus::Error);
+                let _ = app.emit(EVT_ERROR, ErrorPayload { id: id.clone(), message: msg });
+            }
+        },
+    }
+
+    drop(permit);
+}
+
+async fn track_tmp_files(manager: &DownloadManager, id: &str, progress: &Value) {
+    let mut names: Vec<String> = Vec::new();
+    for key in ["tmpfilename", "filename"] {
+        if let Some(name) = progress.get(key).and_then(Value::as_str) {
+            names.push(name.to_string());
+        }
+    }
+    if names.is_empty() {
+        return;
+    }
+    let mut jobs = manager.jobs.lock().await;
+    if let Some(job) = jobs.get_mut(id) {
+        for n in names {
+            if !job.tmp_files.contains(&n) {
+                job.tmp_files.push(n);
+            }
+        }
+    }
+}
+
+fn emit_progress(app: &AppHandle, id: &str, p: &Value, stage: &str) {
+    let downloaded = p.get("downloaded_bytes").and_then(Value::as_u64);
+    let total = p
+        .get("total_bytes")
+        .and_then(Value::as_u64)
+        .or_else(|| p.get("total_bytes_estimate").and_then(Value::as_f64).map(|f| f as u64));
+    let percent = match (downloaded, total) {
+        (Some(d), Some(t)) if t > 0 => Some((d as f64 / t as f64) * 100.0),
+        _ => None,
+    };
+    let _ = app.emit(
+        EVT_PROGRESS,
+        ProgressPayload {
+            id: id.into(),
+            stage: stage.into(),
+            downloaded,
+            total,
+            percent,
+            speed: p.get("speed").and_then(Value::as_f64),
+            eta: p.get("eta").and_then(Value::as_f64),
+        },
+    );
+}
+
+async fn fail_job(app: &AppHandle, manager: &DownloadManager, id: &str, msg: String) {
+    {
+        let mut jobs = manager.jobs.lock().await;
+        if let Some(job) = jobs.get_mut(id) {
+            job.status = JobStatus::Error;
+            job.error = Some(msg.clone());
+        }
+    }
+    emit_status(app, id, JobStatus::Error);
+    let _ = app.emit(EVT_ERROR, ErrorPayload { id: id.into(), message: msg });
+}
+
+async fn kill_job_child(manager: &DownloadManager, id: &str, new_status: JobStatus) -> Result<Vec<String>, String> {
+    let (child, tmp_files) = {
+        let mut jobs = manager.jobs.lock().await;
+        let job = jobs.get_mut(id).ok_or_else(|| "unknown download id".to_string())?;
+        match job.status {
+            JobStatus::Queued | JobStatus::Downloading | JobStatus::Processing => {}
+            _ => return Err("download is not active".into()),
+        }
+        job.status = new_status;
+        (job.child.take(), job.tmp_files.clone())
+    };
+    if let Some(child) = child {
+        let mut child = child.lock().await;
+        let _ = child.kill().await;
+    }
+    Ok(tmp_files)
+}
+
+fn snapshot(id: &str, job: &Job) -> JobSnapshot {
+    JobSnapshot {
+        id: id.to_string(),
+        url: job.request.url.clone(),
+        title: job.request.title.clone(),
+        thumbnail: job.request.thumbnail.clone(),
+        dest_dir: job.request.dest_dir.clone(),
+        audio_only: job.request.audio_only,
+        status: job.status,
+        filepath: job.filepath.clone(),
+        error: job.error.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn start_download(
+    app: AppHandle,
+    manager: State<'_, Arc<DownloadManager>>,
+    request: DownloadRequest,
+) -> Result<String, String> {
+    if !std::path::Path::new(&request.dest_dir).is_dir() {
+        return Err(format!("destination folder does not exist: {}", request.dest_dir));
+    }
+    let id = Uuid::new_v4().to_string();
+    {
+        let mut jobs = manager.jobs.lock().await;
+        jobs.insert(
+            id.clone(),
+            Job {
+                request,
+                status: JobStatus::Queued,
+                child: None,
+                tmp_files: Vec::new(),
+                filepath: None,
+                error: None,
+            },
+        );
+    }
+    emit_status(&app, &id, JobStatus::Queued);
+    let manager = manager.inner().clone();
+    let task_id = id.clone();
+    tauri::async_runtime::spawn(run_job(app, manager, task_id));
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn pause_download(manager: State<'_, Arc<DownloadManager>>, app: AppHandle, id: String) -> Result<(), String> {
+    // yt-dlp keeps .part files; resume re-runs with --continue
+    kill_job_child(&manager, &id, JobStatus::Paused).await?;
+    emit_status(&app, &id, JobStatus::Paused);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn resume_download(manager: State<'_, Arc<DownloadManager>>, app: AppHandle, id: String) -> Result<(), String> {
+    {
+        let mut jobs = manager.jobs.lock().await;
+        let job = jobs.get_mut(&id).ok_or_else(|| "unknown download id".to_string())?;
+        if job.status != JobStatus::Paused && job.status != JobStatus::Error {
+            return Err("download is not paused".into());
+        }
+        job.status = JobStatus::Queued;
+        job.error = None;
+    }
+    emit_status(&app, &id, JobStatus::Queued);
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn(run_job(app, manager, id));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_download(manager: State<'_, Arc<DownloadManager>>, app: AppHandle, id: String) -> Result<(), String> {
+    let tmp_files = kill_job_child(&manager, &id, JobStatus::Cancelled).await?;
+    emit_status(&app, &id, JobStatus::Cancelled);
+    // best-effort cleanup of partial files after the process has died
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for f in tmp_files {
+            for candidate in [f.clone(), format!("{f}.part"), format!("{f}.ytdl")] {
+                let _ = tokio::fs::remove_file(&candidate).await;
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_job(manager: State<'_, Arc<DownloadManager>>, id: String) -> Result<(), String> {
+    let mut jobs = manager.jobs.lock().await;
+    match jobs.get(&id).map(|j| j.status) {
+        Some(JobStatus::Completed | JobStatus::Cancelled | JobStatus::Error | JobStatus::Paused) => {
+            jobs.remove(&id);
+            Ok(())
+        }
+        Some(_) => Err("cancel the download before removing it".into()),
+        None => Ok(()),
+    }
+}
+
+#[tauri::command]
+pub async fn get_queue(manager: State<'_, Arc<DownloadManager>>) -> Result<Vec<JobSnapshot>, String> {
+    let jobs = manager.jobs.lock().await;
+    Ok(jobs.iter().map(|(id, job)| snapshot(id, job)).collect())
+}
+
+#[tauri::command]
+pub async fn set_max_concurrent(manager: State<'_, Arc<DownloadManager>>, max: usize) -> Result<(), String> {
+    manager.set_max_concurrent(max);
+    Ok(())
+}
