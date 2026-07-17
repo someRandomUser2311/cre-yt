@@ -132,6 +132,37 @@ fn emit_status(app: &AppHandle, id: &str, status: JobStatus) {
     let _ = app.emit(EVT_STATUS, StatusPayload { id: id.into(), status });
 }
 
+/// yt-dlp accepts arbitrary URLs; we only ever hand it http(s) links. Reject
+/// anything else so a caller can't coax it into `file:`, `ytdl:` or other
+/// extractor schemes that read the local machine.
+fn validate_url(url: &str) -> Result<(), String> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err("URL must start with http:// or https://".into())
+    }
+}
+
+/// The format selector is passed verbatim to yt-dlp's `-f`. Our UI only ever
+/// produces selectors built from format ids and preset expressions, so we
+/// constrain the input to that grammar as defense-in-depth against an
+/// untrusted caller injecting a hostile selector expression.
+fn validate_format_selector(sel: &str) -> Result<(), String> {
+    const MAX_LEN: usize = 200;
+    if sel.is_empty() || sel.len() > MAX_LEN {
+        return Err("invalid format selector".into());
+    }
+    // allow: format ids, +, /, comparison filters like [height<=1080]
+    let ok = sel
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '[' | ']' | '<' | '>' | '=' | '.' | '_' | '-' | ':' | ' '));
+    if ok {
+        Ok(())
+    } else {
+        Err("format selector contains invalid characters".into())
+    }
+}
+
 fn build_args(req: &DownloadRequest, ffmpeg_dir: &str) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
@@ -381,8 +412,13 @@ async fn fail_job(app: &AppHandle, manager: &DownloadManager, id: &str, msg: Str
     let _ = app.emit(EVT_ERROR, ErrorPayload { id: id.into(), message: msg });
 }
 
-async fn kill_job_child(manager: &DownloadManager, id: &str, new_status: JobStatus) -> Result<Vec<String>, String> {
-    let (child, tmp_files) = {
+struct KilledJob {
+    tmp_files: Vec<String>,
+    dest_dir: String,
+}
+
+async fn kill_job_child(manager: &DownloadManager, id: &str, new_status: JobStatus) -> Result<KilledJob, String> {
+    let (child, tmp_files, dest_dir) = {
         let mut jobs = manager.jobs.lock().await;
         let job = jobs.get_mut(id).ok_or_else(|| "unknown download id".to_string())?;
         match job.status {
@@ -390,13 +426,27 @@ async fn kill_job_child(manager: &DownloadManager, id: &str, new_status: JobStat
             _ => return Err("download is not active".into()),
         }
         job.status = new_status;
-        (job.child.take(), job.tmp_files.clone())
+        (job.child.take(), job.tmp_files.clone(), job.request.dest_dir.clone())
     };
     if let Some(child) = child {
         let mut child = child.lock().await;
         let _ = child.kill().await;
     }
-    Ok(tmp_files)
+    Ok(KilledJob { tmp_files, dest_dir })
+}
+
+/// True when `candidate` sits directly inside `base`. The candidate file may
+/// already be gone, so we resolve its parent directory (which still exists)
+/// and confirm that resolves under the canonicalized base. Guards against a
+/// yt-dlp-reported path escaping the destination via `..` or symlinks.
+fn is_within(base: Option<&std::path::Path>, candidate: &str) -> bool {
+    let Some(base) = base else { return false };
+    let path = std::path::Path::new(candidate);
+    let Some(parent) = path.parent() else { return false };
+    match std::fs::canonicalize(parent) {
+        Ok(real_parent) => real_parent == base,
+        Err(_) => false,
+    }
 }
 
 fn snapshot(id: &str, job: &Job) -> JobSnapshot {
@@ -423,6 +473,10 @@ pub async fn start_download(
     manager: State<'_, Arc<DownloadManager>>,
     request: DownloadRequest,
 ) -> Result<String, String> {
+    validate_url(&request.url)?;
+    if let Some(sel) = request.format_selector.as_deref() {
+        validate_format_selector(sel)?;
+    }
     if !std::path::Path::new(&request.dest_dir).is_dir() {
         return Err(format!("destination folder does not exist: {}", request.dest_dir));
     }
@@ -475,13 +529,19 @@ pub async fn resume_download(manager: State<'_, Arc<DownloadManager>>, app: AppH
 
 #[tauri::command]
 pub async fn cancel_download(manager: State<'_, Arc<DownloadManager>>, app: AppHandle, id: String) -> Result<(), String> {
-    let tmp_files = kill_job_child(&manager, &id, JobStatus::Cancelled).await?;
+    let KilledJob { tmp_files, dest_dir } = kill_job_child(&manager, &id, JobStatus::Cancelled).await?;
     emit_status(&app, &id, JobStatus::Cancelled);
-    // best-effort cleanup of partial files after the process has died
+    // best-effort cleanup of partial files after the process has died.
+    // tmp/filenames originate from yt-dlp output, so constrain deletion to the
+    // job's own destination directory — never follow a path outside it.
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        let base = tokio::fs::canonicalize(&dest_dir).await.ok();
         for f in tmp_files {
             for candidate in [f.clone(), format!("{f}.part"), format!("{f}.ytdl")] {
+                if !is_within(base.as_deref(), &candidate) {
+                    continue;
+                }
                 let _ = tokio::fs::remove_file(&candidate).await;
             }
         }
@@ -512,4 +572,131 @@ pub async fn get_queue(manager: State<'_, Arc<DownloadManager>>) -> Result<Vec<J
 pub async fn set_max_concurrent(manager: State<'_, Arc<DownloadManager>>, max: usize) -> Result<(), String> {
     manager.set_max_concurrent(max);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req() -> DownloadRequest {
+        DownloadRequest {
+            url: "https://example.com/watch?v=abc".into(),
+            dest_dir: "/tmp/out".into(),
+            format_selector: None,
+            audio_only: false,
+            audio_format: None,
+            title: None,
+            thumbnail: None,
+        }
+    }
+
+    /// Return the value following the first occurrence of `flag`.
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str())
+    }
+
+    #[test]
+    fn build_args_default_video_selector() {
+        let args = build_args(&req(), "/ff");
+        assert_eq!(arg_after(&args, "-f"), Some("bestvideo+bestaudio/best"));
+        // url is passed after the `--` terminator, never as a flag
+        assert_eq!(args.last().unwrap(), "https://example.com/watch?v=abc");
+        let dd = args.iter().position(|a| a == "--").unwrap();
+        assert!(args[..dd].iter().all(|a| a != "https://example.com/watch?v=abc"));
+    }
+
+    #[test]
+    fn build_args_uses_explicit_selector() {
+        let mut r = req();
+        r.format_selector = Some("137+140".into());
+        let args = build_args(&r, "/ff");
+        assert_eq!(arg_after(&args, "-f"), Some("137+140"));
+    }
+
+    #[test]
+    fn build_args_audio_mp3_extracts() {
+        let mut r = req();
+        r.audio_only = true;
+        r.audio_format = Some("mp3".into());
+        let args = build_args(&r, "/ff");
+        assert_eq!(arg_after(&args, "-f"), Some("bestaudio/best"));
+        assert!(args.iter().any(|a| a == "-x"));
+        assert_eq!(arg_after(&args, "--audio-format"), Some("mp3"));
+    }
+
+    #[test]
+    fn build_args_audio_m4a_prefers_m4a_stream() {
+        let mut r = req();
+        r.audio_only = true;
+        r.audio_format = Some("m4a".into());
+        let args = build_args(&r, "/ff");
+        assert_eq!(arg_after(&args, "-f"), Some("bestaudio[ext=m4a]/bestaudio/best"));
+        assert_eq!(arg_after(&args, "--audio-format"), Some("m4a"));
+    }
+
+    #[test]
+    fn build_args_passes_ffmpeg_and_dest() {
+        let args = build_args(&req(), "/opt/ff");
+        assert_eq!(arg_after(&args, "--ffmpeg-location"), Some("/opt/ff"));
+        assert_eq!(arg_after(&args, "-P"), Some("/tmp/out"));
+        assert!(args.iter().any(|a| a == "--no-playlist"));
+    }
+
+    #[test]
+    fn validate_url_accepts_http_and_https() {
+        assert!(validate_url("http://x").is_ok());
+        assert!(validate_url("https://x").is_ok());
+    }
+
+    #[test]
+    fn validate_url_rejects_other_schemes() {
+        for u in ["file:///etc/passwd", "ftp://x", "javascript:alert(1)", "  https://x", ""] {
+            assert!(validate_url(u).is_err(), "should reject {u:?}");
+        }
+    }
+
+    #[test]
+    fn validate_format_selector_allows_ui_grammar() {
+        for s in [
+            "137+140",
+            "bestvideo+bestaudio/best",
+            "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+            "bestaudio[ext=m4a]/bestaudio/best",
+        ] {
+            assert!(validate_format_selector(s).is_ok(), "should allow {s:?}");
+        }
+    }
+
+    #[test]
+    fn validate_format_selector_rejects_injection_and_bounds() {
+        assert!(validate_format_selector("").is_err());
+        assert!(validate_format_selector(&"1".repeat(201)).is_err());
+        for s in ["137;rm -rf /", "$(whoami)", "best`id`", "a|b", "a\nb"] {
+            assert!(validate_format_selector(s).is_err(), "should reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn is_within_confines_to_base() {
+        let base_raw = std::env::temp_dir().join(format!("ythx-{}", std::process::id()));
+        std::fs::create_dir_all(&base_raw).unwrap();
+        let base = std::fs::canonicalize(&base_raw).unwrap();
+
+        let inside = base.join("clip.mp4.part");
+        std::fs::write(&inside, b"x").unwrap();
+        assert!(is_within(Some(&base), inside.to_str().unwrap()));
+
+        // a sibling directory's file must not be considered inside
+        let outside = std::env::temp_dir().join("etc-shadow-decoy");
+        assert!(!is_within(Some(&base), outside.to_str().unwrap()));
+
+        // parent escape via ..
+        let escape = base.join("../elsewhere/f");
+        assert!(!is_within(Some(&base), escape.to_str().unwrap()));
+
+        // no base => never within
+        assert!(!is_within(None, inside.to_str().unwrap()));
+
+        std::fs::remove_dir_all(&base_raw).ok();
+    }
 }

@@ -43,6 +43,28 @@ pub fn ffmpeg_location() -> Result<PathBuf, String> {
     exe_dir()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_exe_suffix_matches_platform() {
+        let name = with_exe_suffix(YTDLP);
+        assert!(name.starts_with("yt-dlp"));
+        assert!(name.ends_with(std::env::consts::EXE_SUFFIX));
+        #[cfg(windows)]
+        assert_eq!(name, "yt-dlp.exe");
+        #[cfg(not(windows))]
+        assert_eq!(name, "yt-dlp");
+    }
+
+    #[test]
+    fn exe_dir_resolves() {
+        // current_exe of the test binary always has a parent dir
+        assert!(exe_dir().unwrap().is_absolute());
+    }
+}
+
 /// Base yt-dlp command with platform quirks applied.
 pub fn ytdlp_command(app: &AppHandle) -> Result<Command, String> {
     let mut cmd = Command::new(ytdlp_path(app)?);

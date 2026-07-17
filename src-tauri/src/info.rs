@@ -174,3 +174,121 @@ pub async fn fetch_video_info(app: AppHandle, url: String) -> Result<MediaInfo, 
         .map_err(|e| format!("could not parse yt-dlp output: {e}"))?;
     Ok(parse_media_info(&root))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn opt_str_filters_empty_and_none_sentinels() {
+        let v = json!({ "a": "x", "b": "", "c": "none", "d": 5 });
+        assert_eq!(opt_str(&v, "a"), Some("x".into()));
+        assert_eq!(opt_str(&v, "b"), None);
+        assert_eq!(opt_str(&v, "c"), None);
+        assert_eq!(opt_str(&v, "d"), None);
+        assert_eq!(opt_str(&v, "missing"), None);
+    }
+
+    #[test]
+    fn opt_numbers_read_typed_values() {
+        let v = json!({ "f": 1.5, "u": 42, "s": "nope" });
+        assert_eq!(opt_f64(&v, "f"), Some(1.5));
+        assert_eq!(opt_u64(&v, "u"), Some(42));
+        assert_eq!(opt_f64(&v, "s"), None);
+        assert_eq!(opt_u64(&v, "missing"), None);
+    }
+
+    #[test]
+    fn parse_format_skips_non_media_and_storyboards() {
+        // storyboard pseudo-format
+        assert!(parse_format(&json!({ "format_id": "sb0", "ext": "mhtml" })).is_none());
+        // no codecs at all
+        assert!(parse_format(&json!({ "format_id": "x", "ext": "mp4" })).is_none());
+        // missing id
+        assert!(parse_format(&json!({ "ext": "mp4", "vcodec": "h264" })).is_none());
+    }
+
+    #[test]
+    fn parse_format_reads_video_stream() {
+        let f = parse_format(&json!({
+            "format_id": "137",
+            "ext": "mp4",
+            "resolution": "1920x1080",
+            "height": 1080,
+            "fps": 30.0,
+            "vcodec": "avc1",
+            "acodec": "none",
+            "filesize": 1000u64,
+            "tbr": 2500.0,
+        }))
+        .expect("format should parse");
+        assert_eq!(f.format_id, "137");
+        assert_eq!(f.height, Some(1080));
+        assert_eq!(f.vcodec.as_deref(), Some("avc1"));
+        // "none" acodec sentinel is filtered to None by opt_str
+        assert_eq!(f.acodec, None);
+    }
+
+    #[test]
+    fn parse_media_info_single_video() {
+        let root = json!({
+            "_type": "video",
+            "title": "My Clip",
+            "webpage_url": "https://y/watch?v=1",
+            "thumbnail": "https://y/t.jpg",
+            "duration": 120.0,
+            "channel": "Chan",
+            "formats": [
+                { "format_id": "137", "ext": "mp4", "vcodec": "avc1", "acodec": "none" },
+                { "format_id": "sb", "ext": "mhtml" }
+            ],
+        });
+        let info = parse_media_info(&root);
+        assert!(!info.is_playlist);
+        assert_eq!(info.title, "My Clip");
+        assert_eq!(info.uploader.as_deref(), Some("Chan"));
+        assert_eq!(info.formats.len(), 1); // storyboard filtered out
+    }
+
+    #[test]
+    fn parse_media_info_defaults_and_thumbnail_fallback() {
+        let root = json!({
+            "thumbnails": [ { "url": "https://y/low.jpg" }, { "url": "https://y/high.jpg" } ],
+        });
+        let info = parse_media_info(&root);
+        assert_eq!(info.title, "Untitled");
+        assert_eq!(info.webpage_url, "");
+        // falls back to the last thumbnail in the array
+        assert_eq!(info.thumbnail.as_deref(), Some("https://y/high.jpg"));
+    }
+
+    #[test]
+    fn parse_media_info_playlist_reconstructs_missing_urls() {
+        let root = json!({
+            "_type": "playlist",
+            "title": "PL",
+            "entries": [
+                { "id": "aaa", "title": "One" },
+                { "id": "bbb", "title": "Two", "url": "https://custom/x" }
+            ],
+        });
+        let info = parse_media_info(&root);
+        assert!(info.is_playlist);
+        assert_eq!(info.entries.len(), 2);
+        assert_eq!(info.entries[0].url.as_deref(), Some("https://www.youtube.com/watch?v=aaa"));
+        assert_eq!(info.entries[1].url.as_deref(), Some("https://custom/x"));
+    }
+
+    #[test]
+    fn extract_error_prefers_last_error_line() {
+        let stderr = "WARNING: something\nERROR: first bad\nERROR: Video unavailable\n";
+        assert_eq!(extract_error(stderr), "Video unavailable");
+    }
+
+    #[test]
+    fn extract_error_falls_back_to_tail() {
+        let stderr = "line one\nline two\nline three";
+        assert_eq!(extract_error(stderr), "line one line two line three");
+    }
+}
